@@ -7,9 +7,15 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"syscall"
 	"time"
+
+	log "github.com/Sirupsen/logrus"
+
+	"github.com/chendrak/socks"
 )
 
 const (
@@ -24,7 +30,11 @@ const (
 // some whois Requests.
 type Client struct {
 	httpClient *http.Client
-	timeout    time.Duration
+	dialFunc   func(network, addr string) (net.Conn, error)
+}
+
+type DefaultTimeoutDialer struct {
+	timeout time.Duration
 }
 
 // DefaultClient represents a shared whois client with a default timeout, HTTP
@@ -33,20 +43,52 @@ var DefaultClient = NewClient(DefaultTimeout)
 
 // NewClient creates and initializes a new Client with the specified timeout.
 func NewClient(timeout time.Duration) *Client {
+	return NewClientWithProxy(timeout, "")
+}
+
+// NewClientWithProxy creates and initializes a new Client with the specified timeout.
+// Additionally, it initializes the internal proxy. The provided proxy must be a SOCKS proxy.
+// If the proxy string includes the scheme (like socks5://127.0.0.1:1234), it will be used, otherwise it defaults to SOCKS4
+func NewClientWithProxy(timeout time.Duration, proxy string) *Client {
+	var proxyFunc func(*http.Request) (*url.URL, error)
+	var dialFunc func(string, string) (net.Conn, error)
+
+	if proxy != "" {
+		proxyURL, err := url.Parse(proxy)
+		if err != nil {
+			log.Debugf("Error parsing URL (%s): %s", proxy, err)
+			proxyFunc = nil
+		} else {
+			proxyFunc = http.ProxyURL(proxyURL)
+
+			log.Debugf("Parsing URL (%s) successful! Host: %s\n", proxy, proxyURL.Host)
+
+			if strings.ToLower(proxyURL.Scheme) == "socks5" {
+				dialFunc = socks.DialSocksProxyTimeout(socks.SOCKS5, proxyURL.Host, timeout)
+			} else {
+				dialFunc = socks.DialSocksProxyTimeout(socks.SOCKS4, proxyURL.Host, timeout)
+			}
+		}
+	} else {
+		log.Debugf("Proxy string empty!")
+		dialer := &DefaultTimeoutDialer{timeout: timeout}
+		dialFunc = dialer.Dial
+	}
+
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 proxyFunc,
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
 	}
-	client := &Client{timeout: timeout}
-	transport.Dial = client.Dial
+	client := &Client{dialFunc: dialFunc}
+	transport.Dial = dialFunc
 	client.httpClient = &http.Client{Transport: transport}
 	return client
 }
 
 // Dial implements the Dial interface, strictly enforcing that cumulative dial +
 // read time is limited to timeout. It applies to both whois and HTTP connections.
-func (c *Client) Dial(network, address string) (net.Conn, error) {
+func (c *DefaultTimeoutDialer) Dial(network, address string) (net.Conn, error) {
 	deadline := time.Now().Add(c.timeout)
 	conn, err := net.DialTimeout(network, address, c.timeout)
 	if err != nil {
@@ -54,6 +96,12 @@ func (c *Client) Dial(network, address string) (net.Conn, error) {
 	}
 	conn.SetDeadline(deadline)
 	return conn, nil
+}
+
+// Dial implements the Dial interface, strictly enforcing that cumulative dial +
+// read time is limited to timeout. It applies to both whois and HTTP connections.
+func (c *Client) Dial(network, address string) (net.Conn, error) {
+	return c.dialFunc(network, address)
 }
 
 // Fetch sends the Request to a whois server.
